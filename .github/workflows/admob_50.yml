@@ -2,7 +2,7 @@ name: AdMob Sync - Account 2
 
 on:
   schedule:
-    - cron: '15 6 * * *'    # 06:15 UTC daily (15 min after account 1)
+    - cron: '15 6 * * *'    # 06:15 UTC daily (after Account 1)
   workflow_dispatch:
     inputs:
       days_back:
@@ -33,7 +33,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install google-api-python-client google-auth google-auth-oauthlib google-cloud-bigquery
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install google-api-python-client google-auth google-auth-oauthlib google-cloud-bigquery
+          fi
 
       - name: Run AdMob Sync - Account 2
         env:
@@ -42,17 +46,16 @@ jobs:
           BQ_DATASET_ID:         ${{ secrets.BQ_DATASET_ID }}
           BQ_LOCATION:           ${{ secrets.BQ_LOCATION }}
           ADMOB_REPORT_CURRENCY: ${{ secrets.ADMOB_REPORT_CURRENCY }}
-          # Account 2 OAuth (NEW SECRETS)
           ADMOB_PUBLISHER_ID:    ${{ secrets.ADMOB_PUBLISHER_ID_ACCOUNT2 }}
           OAUTH_CLIENT_ID:       ${{ secrets.OAUTH_CLIENT_ID_ACCOUNT2 }}
           OAUTH_CLIENT_SECRET:   ${{ secrets.OAUTH_CLIENT_SECRET_ACCOUNT2 }}
           OAUTH_REFRESH_TOKEN:   ${{ secrets.OAUTH_REFRESH_TOKEN_ACCOUNT2 }}
         run: |
           if [ -n "${{ github.event.inputs.backfill_start }}" ] && [ -n "${{ github.event.inputs.backfill_end }}" ]; then
-            python src/admob_full_sync_account2.py \
+            python src/admob_python.py \
               --backfill-start "${{ github.event.inputs.backfill_start }}" \
               --backfill-end "${{ github.event.inputs.backfill_end }}"
           else
-            python src/admob_full_sync_account2.py \
+            python src/admob_python.py \
               --days "${{ github.event.inputs.days_back || '2' }}"
           fi
