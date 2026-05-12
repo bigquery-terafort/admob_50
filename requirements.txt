@@ -1,1 +1,8 @@
-j
+# Google Cloud libraries
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-cloud-bigquery>=3.13.0
+
+# Utilities
+python-dateutil>=2.8.2
