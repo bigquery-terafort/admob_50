@@ -4,6 +4,8 @@ AdMob → BigQuery  (ACCOUNT 2)
 Identical to v3 FINAL but with:
 - publisher_id column added to all writes
 - Publisher-scoped DELETE (won't wipe account 1 or 3 data)
+- Retry + schema-check wrapper around DELETE operations
+  (defends against BigQuery metadata cache staleness)
 - Uses ACCOUNT 2's OAuth credentials via env vars
 """
 
@@ -21,6 +23,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.cloud import bigquery
+from google.api_core.exceptions import NotFound
 from google.oauth2 import service_account
 
 socket.setdefaulttimeout(180)
@@ -334,26 +337,55 @@ def load_rows(bq: bigquery.Client, table: str, schema, rows: List[Dict],
 
 def delete_range_for_publisher(bq: bigquery.Client, table: str, publisher_id: str,
                                 start: date, end: date):
-    """Delete ONLY this publisher's rows. Won't touch account 1 or 3 data."""
+    """
+    Delete ONLY this publisher's rows. Won't touch account 1 or 3 data.
+    Retries on transient BigQuery errors (metadata cache, streaming buffer, etc).
+    """
     tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
-    bq.query(
-        f"""
-        DELETE FROM `{tid}`
-        WHERE report_date BETWEEN '{start}' AND '{end}'
-          AND publisher_id = '{publisher_id}'
-        """
-    ).result()
+
+    def _do_delete():
+        return bq.query(
+            f"""
+            DELETE FROM `{tid}`
+            WHERE report_date BETWEEN '{start}' AND '{end}'
+              AND publisher_id = '{publisher_id}'
+            """
+        ).result()
+
+    with_retry(_do_delete, label=f"delete_range_{table}")
     print(f"  Deleted {table} for {publisher_id}: {start} → {end}")
 
 def delete_dim_for_publisher(bq: bigquery.Client, table: str, publisher_id: str):
-    """Delete ONLY this publisher's dim rows."""
+    """
+    Delete ONLY this publisher's dim rows.
+    Verifies publisher_id column exists first (guards against metadata cache staleness),
+    then retries on transient BigQuery errors.
+    """
     tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
-    bq.query(
-        f"""
-        DELETE FROM `{tid}`
-        WHERE publisher_id = '{publisher_id}'
-        """
-    ).result()
+
+    # Defensive: verify publisher_id column exists in CURRENT schema view
+    # (defends against BigQuery metadata cache staleness right after schema changes)
+    try:
+        table_ref = bq.get_table(tid)
+        column_names = {f.name for f in table_ref.schema}
+        if 'publisher_id' not in column_names:
+            print(f"  ⚠️  {table} missing publisher_id column in cached schema — skipping DELETE")
+            return
+    except NotFound:
+        print(f"  ⚠️  {table} not found — skipping DELETE (will be created downstream)")
+        return
+    except Exception as e:
+        print(f"  ⚠️  Could not verify {table} schema: {e} — proceeding with DELETE anyway")
+
+    def _do_delete():
+        return bq.query(
+            f"""
+            DELETE FROM `{tid}`
+            WHERE publisher_id = '{publisher_id}'
+            """
+        ).result()
+
+    with_retry(_do_delete, label=f"delete_dim_{table}")
     print(f"  Deleted dim {table} for {publisher_id}")
 
 def write_log(bq, run_id, publisher_id, run_type, start, end, status, totals, error, duration):
