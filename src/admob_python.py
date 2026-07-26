@@ -1,32 +1,42 @@
 """
-AdMob → BigQuery  (PRODUCTION v4) — pub-5036550218341905
+AdMob → BigQuery  (PRODUCTION v5)
 ==========================================================
-THIS REPO HANDLES: pub-5036550218341905
+⚠️  YE FILE CHAARO REPOS MEIN BILKUL EK JAISI LAGTI HAI.
+    Publisher ka farq sirf ADMOB_PUBLISHER_ID env var se aata hai:
+        pub-5972202469838280   pub-5036550218341905
+        pub-4905254875899379   pub-9688592152492531
 
 VERSION HISTORY:
   v3 FINAL: Original (no publisher_id, wiped other accounts' data)
-  v4:       Production-grade unified template
-            ✅ publisher_id in all schemas + rows
-            ✅ Publisher-scoped DELETEs (won't touch other accounts)
-            ✅ Auto schema migration (ALTER TABLE ADD COLUMN IF NOT EXISTS)
-            ✅ DELETE retry wrapper + schema verification
-            ✅ Hard fail if publisher_id env var is missing
-            ✅ Wait for schema cache after migrations
-            ✅ Specific NotFound exception (not bare except)
+  v4:       publisher_id everywhere · publisher-scoped DELETEs · auto schema
+            migration · DELETE retry + schema verification · hard fail on
+            missing publisher_id
+  v5 (2026-07-26) — DATA-LOSS GUARDS:
+            🔴 sync_one_day mein DELETE ab SAB SE AAKHIR mein hai.
+               v4 mein `delete_range_for_publisher(...)` pehli line thi aur
+               fetch uske baad. Agar fetch adhoora rahe (403 batches) ya
+               khali laut aaye, us din ka data UD JATA aur admob_sync_log
+               phir bhi "SUCCESS" likh deta.
+               (Bilkul yehi shakl Apple ke analytics_app_store_downloads ke
+                saath hui — aadha saal is tarah gaya.)
+            🔴 fetch_batched ab (rows, skipped) deta hai. v4 mein 403 pe
+               sirf `print WARNING` tha — adhoora data chup-chaap guzar jata.
+            🛡️ GUARD 1: koi batch 403 → us din ko haath hi mat lagao
+            🛡️ GUARD 2: teeno report khali → bhi haath mat lagao
 
 REQUIRED ENV VARS:
-   ADMOB_PUBLISHER_ID    = pub-5036550218341905   (or accounts/pub-5036550218341905)
+   ADMOB_PUBLISHER_ID    = pub-XXXXXXXXXXXXXXXX  (ya accounts/pub-XXXX)
    GCP_PROJECT_ID        = terafort
    BQ_DATASET_ID         = Admob (default)
    BQ_LOCATION           = US (default)
-   OAUTH_CLIENT_ID       = <OAuth client for pub-5036's AdMob account>
+   OAUTH_CLIENT_ID       = <OAuth client for this AdMob account>
    OAUTH_CLIENT_SECRET   = <OAuth secret>
-   OAUTH_REFRESH_TOKEN   = <Refresh token specific to pub-5036>
+   OAUTH_REFRESH_TOKEN   = <Refresh token for THIS publisher>
    GCP_CREDENTIALS_JSON  = <Service account JSON>
 
 USAGE:
-   python admob_sync_v4.py --days 3
-   python admob_sync_v4.py --backfill-start 2026-04-30 --backfill-end 2026-05-19
+   python admob_sync_v5.py --days 3
+   python admob_sync_v5.py --backfill-start 2026-07-19 --backfill-end 2026-07-26
 
 DATA MODEL:
    Money fields: INT64 MICROS — divide by 1,000,000 for USD
@@ -41,7 +51,7 @@ import time
 import argparse
 import socket
 from datetime import datetime, timedelta, date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -187,7 +197,6 @@ def validate_config() -> bool:
         print(f"❌ ERROR: Missing env vars: {', '.join(missing)}")
         return False
 
-    # Extra strictness — publisher_id must look like a real AdMob publisher
     pid = normalize_publisher_id(ADMOB_PUBLISHER_ID)
     if not pid.startswith("pub-") or len(pid) < 10:
         print(f"❌ ERROR: ADMOB_PUBLISHER_ID looks invalid: '{pid}'")
@@ -339,11 +348,7 @@ def ensure_dataset(bq: bigquery.Client):
         print(f"  Created dataset: {ds_id}")
 
 def migrate_table_schema(bq: bigquery.Client, table_name: str, expected_schema):
-    """
-    Auto-add missing columns to existing table.
-    ALTER TABLE ADD COLUMN IF NOT EXISTS for any missing columns.
-    Fixes schema drift between accounts using shared tables.
-    """
+    """Auto-add missing columns to existing table (schema drift across accounts)."""
     tid = f"{PROJECT_ID}.{DATASET_ID}.{table_name}"
     try:
         table = bq.get_table(tid)
@@ -356,19 +361,12 @@ def migrate_table_schema(bq: bigquery.Client, table_name: str, expected_schema):
     for field in expected_schema:
         if field.name in existing_columns:
             continue
-
-        # REPEATED and RECORD columns can't be added via simple ALTER
         if field.mode == "REPEATED" or field.field_type == "RECORD":
-            print(
-                f"  ⚠️  Cannot auto-migrate {table_name}.{field.name} "
-                f"({field.field_type}/{field.mode}) — needs manual ALTER"
-            )
+            print(f"  ⚠️  Cannot auto-migrate {table_name}.{field.name} "
+                  f"({field.field_type}/{field.mode}) — needs manual ALTER")
             continue
-
-        alter_sql = (
-            f"ALTER TABLE `{tid}` "
-            f"ADD COLUMN IF NOT EXISTS {field.name} {field.field_type}"
-        )
+        alter_sql = (f"ALTER TABLE `{tid}` "
+                     f"ADD COLUMN IF NOT EXISTS {field.name} {field.field_type}")
         try:
             bq.query(alter_sql).result()
             print(f"  Migrated {table_name}: added {field.name} ({field.field_type})")
@@ -376,11 +374,9 @@ def migrate_table_schema(bq: bigquery.Client, table_name: str, expected_schema):
         except Exception as e:
             print(f"  ⚠️  Migration failed for {table_name}.{field.name}: {e}")
 
-    # Wait for BQ metadata cache to refresh after schema changes
     if migrations_run > 0:
-        print(f"  ⏱️  Waiting {SCHEMA_CACHE_WAIT_SEC}s for {table_name} schema cache to refresh …")
+        print(f"  ⏱️  Waiting {SCHEMA_CACHE_WAIT_SEC}s for {table_name} schema cache …")
         time.sleep(SCHEMA_CACHE_WAIT_SEC)
-        # Force refresh by re-fetching
         bq.get_table(tid)
 
 def ensure_table(bq: bigquery.Client, name: str, schema, is_fact=False):
@@ -418,11 +414,7 @@ def load_rows(bq: bigquery.Client, table: str, schema, rows: List[Dict],
     return n
 
 def _verify_publisher_id_column(bq: bigquery.Client, table: str) -> bool:
-    """
-    Defensive check: confirm publisher_id column exists in table.
-    Guards against BigQuery metadata cache staleness right after migrations.
-    Returns True if column exists, False otherwise.
-    """
+    """Confirm publisher_id column exists (guards BQ metadata cache staleness)."""
     tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
     try:
         table_ref = bq.get_table(tid)
@@ -439,13 +431,8 @@ def _verify_publisher_id_column(bq: bigquery.Client, table: str) -> bool:
         return True  # Proceed anyway — don't block on transient errors
 
 def delete_range_for_publisher(bq: bigquery.Client, table: str, publisher_id: str,
-                                start: date, end: date):
-    """
-    Delete ONLY this publisher's fact rows for the given date range.
-    Publisher-scoped — will NOT touch other accounts' data.
-    Retries on transient BQ errors.
-    Verifies publisher_id column exists first.
-    """
+                               start: date, end: date):
+    """Delete ONLY this publisher's fact rows for the range. Never touches others."""
     if not publisher_id:
         raise ValueError("delete_range_for_publisher: publisher_id is required (empty)")
 
@@ -468,10 +455,7 @@ def delete_range_for_publisher(bq: bigquery.Client, table: str, publisher_id: st
     print(f"  Deleted {table} for {publisher_id}: {start} → {end}")
 
 def delete_dim_for_publisher(bq: bigquery.Client, table: str, publisher_id: str):
-    """
-    Delete ONLY this publisher's dim rows.
-    Publisher-scoped, retry-wrapped, schema-verified.
-    """
+    """Delete ONLY this publisher's dim rows."""
     if not publisher_id:
         raise ValueError("delete_dim_for_publisher: publisher_id is required (empty)")
 
@@ -483,10 +467,7 @@ def delete_dim_for_publisher(bq: bigquery.Client, table: str, publisher_id: str)
 
     def _do_delete():
         return bq.query(
-            f"""
-            DELETE FROM `{tid}`
-            WHERE publisher_id = '{publisher_id}'
-            """
+            f"DELETE FROM `{tid}` WHERE publisher_id = '{publisher_id}'"
         ).result()
 
     with_retry(_do_delete, label=f"delete_dim_{table}")
@@ -522,7 +503,6 @@ def sync_dims(v1, bq: bigquery.Client, account: str, publisher_id: str) -> List[
 
     acc = with_retry(lambda: v1.accounts().get(name=account).execute())
 
-    # Account dim — publisher-scoped delete then append
     if _verify_publisher_id_column(bq, DIM_ACCOUNT):
         with_retry(lambda: bq.query(
             f"""
@@ -545,8 +525,7 @@ def sync_dims(v1, bq: bigquery.Client, account: str, publisher_id: str) -> List[
         lambda pageToken=None: v1.accounts().apps().list(parent=account, pageToken=pageToken),
         "apps"
     )
-    app_rows = []
-    app_ids  = []
+    app_rows, app_ids = [], []
     for a in apps:
         mi = a.get("manualAppInfo", {})
         li = a.get("linkedAppInfo", {})
@@ -598,10 +577,7 @@ def _base_spec(start: date, end: date) -> Dict:
     }
 
 def _app_filter(app_ids: List[str]) -> Dict:
-    return {
-        "dimension": "APP",
-        "matchesAny": {"values": app_ids}
-    }
+    return {"dimension": "APP", "matchesAny": {"values": app_ids}}
 
 def network_spec(start, end, app_ids):
     spec = _base_spec(start, end)
@@ -682,10 +658,12 @@ def parse_network_rows(report, run_id, publisher_id):
     ts, rows = utc_now(), []
     for item in report:
         rd = item.get("row")
-        if not rd: continue
+        if not rd:
+            continue
         dims, mets = rd.get("dimensionValues", {}), rd.get("metricValues", {})
         dt = parse_date_from_dims(dims)
-        if not dt: continue
+        if not dt:
+            continue
         row = _empty_row("admob_network", ts, run_id, publisher_id)
         row["report_date"] = dt
         _set_base_dims(row, dims)
@@ -712,10 +690,12 @@ def parse_network_adtype_rows(report, run_id, publisher_id):
     ts, rows = utc_now(), []
     for item in report:
         rd = item.get("row")
-        if not rd: continue
+        if not rd:
+            continue
         dims, mets = rd.get("dimensionValues", {}), rd.get("metricValues", {})
         dt = parse_date_from_dims(dims)
-        if not dt: continue
+        if not dt:
+            continue
         row = _empty_row("admob_network_adtype", ts, run_id, publisher_id)
         row["report_date"] = dt
         _set_base_dims(row, dims)
@@ -739,10 +719,12 @@ def parse_mediation_rows(report, run_id, publisher_id):
     ts, rows = utc_now(), []
     for item in report:
         rd = item.get("row")
-        if not rd: continue
+        if not rd:
+            continue
         dims, mets = rd.get("dimensionValues", {}), rd.get("metricValues", {})
         dt = parse_date_from_dims(dims)
-        if not dt: continue
+        if not dt:
+            continue
         row = _empty_row("admob_mediation", ts, run_id, publisher_id)
         row["report_date"] = dt
         _set_base_dims(row, dims)
@@ -770,12 +752,18 @@ def parse_mediation_rows(report, run_id, publisher_id):
     return rows
 
 # =============================================================================
-# BATCHED FETCH
+# BATCHED FETCH   🛡️ v5: ab (rows, skipped) deta hai
 # =============================================================================
 
 def fetch_batched(v1, account, app_ids, start, end, run_id, publisher_id,
-                  spec_fn, parse_fn, fetch_fn, batch_size, label):
-    all_rows = []
+                  spec_fn, parse_fn, fetch_fn, batch_size, label) -> Tuple[List[Dict], int]:
+    """v5: skipped batches ki GINTI bhi wapas karta hai.
+
+    v4 mein 403 pe sirf `print WARNING` tha — adhoora data chup-chaap
+    guzar jata aur caller poore din ka DELETE kar deta.
+    """
+    all_rows: List[Dict] = []
+    skipped  = 0                                    # 🛡️ v5
     batches  = make_batches(app_ids, batch_size)
     total_b  = len(batches)
 
@@ -790,21 +778,18 @@ def fetch_batched(v1, account, app_ids, start, end, run_id, publisher_id,
         except HttpError as e:
             if e.resp.status == 403:
                 print(f"  WARNING: {label} batch {i}/{total_b} skipped — 403")
+                skipped += 1                        # 🛡️ v5: chhupao mat
             else:
                 raise
 
-    return all_rows
+    return all_rows, skipped
 
 # =============================================================================
 # ACCOUNT RESOLUTION
 # =============================================================================
 
 def get_account_name(v1) -> str:
-    """
-    Resolve AdMob account resource name.
-    HARD FAILS if ADMOB_PUBLISHER_ID env var is empty — won't fall back to
-    accounts[0] like the old script (which could pick the wrong account).
-    """
+    """HARD FAILS if ADMOB_PUBLISHER_ID is empty — never auto-picks accounts[0]."""
     if not ADMOB_PUBLISHER_ID:
         raise ValueError(
             "ADMOB_PUBLISHER_ID env var is required. "
@@ -827,43 +812,71 @@ def ensure_all_tables(bq: bigquery.Client):
     ensure_table(bq, LOG_TABLE,    SYNC_LOG_SCHEMA)
 
 # =============================================================================
-# SYNC ONE DAY
+# SYNC ONE DAY   🔴 v5 KA ASLI FIX
 # =============================================================================
 
 def sync_one_day(v1, bq, account, app_ids, publisher_id, day, run_id) -> Dict[str, int]:
+    """v5: PEHLE poora data haath mein lo — TAB purana hatao.
+
+    v4 mein `delete_range_for_publisher(...)` sab se pehli line thi aur fetch
+    uske baad. Agar fetch adhoora rahe (403 batches) ya khali laut aaye, us
+    din ka data HAMESHA ke liye gaya — aur admob_sync_log phir bhi "SUCCESS"
+    likh deta.
+    """
     totals = {"network": 0, "network_adtype": 0, "mediation": 0}
 
-    delete_range_for_publisher(bq, FACT_TABLE, publisher_id, day, day)
-
     print(f"  [{day}] Fetching network for {publisher_id} …")
-    net_rows = fetch_batched(
+    net_rows, net_skip = fetch_batched(
         v1, account, app_ids, day, day, run_id, publisher_id,
         network_spec, parse_network_rows, fetch_network,
         BATCH_NETWORK, "network"
     )
-    totals["network"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, net_rows)
 
     print(f"  [{day}] Fetching network_adtype for {publisher_id} …")
-    nat_rows = fetch_batched(
+    nat_rows, nat_skip = fetch_batched(
         v1, account, app_ids, day, day, run_id, publisher_id,
         network_adtype_spec, parse_network_adtype_rows, fetch_network,
         BATCH_NETWORK_ADTYPE, "network_adtype"
     )
-    totals["network_adtype"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, nat_rows)
 
     print(f"  [{day}] Fetching mediation for {publisher_id} …")
     try:
-        med_rows = fetch_batched(
+        med_rows, med_skip = fetch_batched(
             v1, account, app_ids, day, day, run_id, publisher_id,
             mediation_spec, parse_mediation_rows, fetch_mediation_report,
             BATCH_MEDIATION, "mediation"
         )
-        totals["mediation"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, med_rows)
     except HttpError as e:
         if e.resp.status == 403:
             print(f"  [{day}] WARNING: Mediation skipped — 403 (no access)")
+            med_rows, med_skip = [], 0
         else:
             raise
+
+    # ── 🛡️ GUARD 1: koi bhi batch 403 hua → us din ko haath mat lagao ──
+    #    Adhoore data ke saath DELETE = jo batches nahi aayin unka data
+    #    hamesha ke liye gaya. Purana data bacha rehna behtar hai.
+    skipped = net_skip + nat_skip + med_skip
+    if skipped:
+        raise RuntimeError(
+            f"[{day}] {skipped} batch(es) returned 403 — data is INCOMPLETE. "
+            f"Refusing to delete+reload this day; existing rows preserved. "
+            f"Fix AdMob API access for {publisher_id} and re-run."
+        )
+
+    # ── 🛡️ GUARD 2: teeno report bilkul khali → bhi haath mat lagao ──
+    if not (net_rows or nat_rows or med_rows):
+        print(f"  [{day}] ⚠️  API returned 0 rows across ALL 3 reports — "
+              f"SKIPPING delete+load entirely (existing data preserved). "
+              f"Next run will retry.")
+        return totals
+
+    # ── ab mehfooz: poora data haath mein hai, TAB purana hatao ──
+    delete_range_for_publisher(bq, FACT_TABLE, publisher_id, day, day)
+
+    totals["network"]        = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, net_rows)
+    totals["network_adtype"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, nat_rows)
+    totals["mediation"]      = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, med_rows)
 
     return totals
 
@@ -878,7 +891,7 @@ def sync(days_back: int = 3):
     end_date     = datetime.utcnow().date() - timedelta(days=1)
     start_date   = end_date - timedelta(days=days_back - 1)
 
-    print(f"\n=== AdMob Sync v4 | publisher={publisher_id} | run_id={rid} ===")
+    print(f"\n=== AdMob Sync v5 | publisher={publisher_id} | run_id={rid} ===")
     print(f"  Date range : {start_date} → {end_date}")
 
     creds   = get_fresh_credentials()
@@ -910,7 +923,7 @@ def sync(days_back: int = 3):
         raise
     finally:
         write_log(bq, rid, publisher_id, "sync", start_date, end_date,
-                  status, grand, error, time.time()-t0)
+                  status, grand, error, time.time() - t0)
 
     print(f"\n=== Sync complete for {publisher_id} ===")
     print(json.dumps(grand, indent=2))
@@ -922,7 +935,7 @@ def backfill(start_str: str, end_str: str):
     start_date   = datetime.strptime(start_str, "%Y-%m-%d").date()
     end_date     = datetime.strptime(end_str,   "%Y-%m-%d").date()
 
-    print(f"\n=== AdMob Backfill v4 | publisher={publisher_id} | run_id={rid} ===")
+    print(f"\n=== AdMob Backfill v5 | publisher={publisher_id} | run_id={rid} ===")
     print(f"  Date range : {start_date} → {end_date}")
 
     creds   = get_fresh_credentials()
@@ -962,7 +975,7 @@ def backfill(start_str: str, end_str: str):
         raise
     finally:
         write_log(bq, rid, publisher_id, "backfill", start_date, end_date,
-                  status, grand, error, time.time()-t0)
+                  status, grand, error, time.time() - t0)
 
     print(f"\n=== Backfill complete for {publisher_id} ===")
     print(json.dumps(grand, indent=2))
@@ -972,7 +985,7 @@ def backfill(start_str: str, end_str: str):
 # =============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="AdMob → BigQuery sync v4")
+    p = argparse.ArgumentParser(description="AdMob → BigQuery sync v5")
     p.add_argument("--days",           type=int, default=3)
     p.add_argument("--backfill-start", type=str)
     p.add_argument("--backfill-end",   type=str)
