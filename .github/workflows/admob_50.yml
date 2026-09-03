@@ -10,7 +10,11 @@ name: AdMob Full Sync to BigQuery
 #    python: can't open file '.../src/admob_full_sync.py': No such file
 #    Har repo ka layout alag hai. Kuch mein script root pe hai, kuch mein
 #    src/ ke andar. Hard-coded path chaaro repos mein kaam nahi karta.
-#    → Ab workflow script ko KHUD DHOONDHTI hai (find). Kahin bhi rakho,
+#    Aur naam bhi har repo mein alag hai:
+#        admob_50   -> src/admob_python.py
+#        Admob_4    -> src/admob_full_sync.py
+#    → Ab workflow script ko NAAM se nahi, us ke ANDAR ke marker
+#      ('admob_unified_fact') se dhoondhti hai. Naam/folder kuch bhi ho,
 #      chal jayegi.
 #
 #  RUN #110 KYUN MARA — 0 SECONDS, YAML PARSE ERROR
@@ -84,9 +88,12 @@ jobs:
           CHUNK_DAYS: ${{ github.event.inputs.chunk_days || '15' }}
         run: |
           set -euo pipefail
-          SCRIPT=$(find . -name 'admob_full_sync.py' -not -path './.git/*' | head -1)
+          # Script ko NAAM se nahi, ANDAR ke marker se dhoondho. Chaaro repos
+          # mein file ka naam alag hai (admob_python.py / admob_full_sync.py /
+          # admob_sync_v5.py) aur folder bhi alag (root ya src/).
+          SCRIPT=$(grep -rl 'admob_unified_fact' --include='*.py' . 2>/dev/null | head -1)
           if [ -z "$SCRIPT" ]; then
-            echo "::error::admob_full_sync.py repo mein kahin nahi mili"
+            echo "::error::AdMob sync script nahi mili (koi .py file mein 'admob_unified_fact' nahi)"
             find . -name '*.py' -not -path './.git/*' | head -20
             exit 1
           fi
@@ -126,7 +133,7 @@ jobs:
           DAYS_BACK: ${{ github.event.inputs.days_back || '3' }}
         run: |
           set -euo pipefail
-          SCRIPT=$(find . -name 'admob_full_sync.py' -not -path './.git/*' | head -1)
+          SCRIPT=$(grep -rl 'admob_unified_fact' --include='*.py' . 2>/dev/null | head -1)
           echo "Using script: $SCRIPT"
           python "$SCRIPT" --days "${DAYS_BACK}"
 
@@ -143,7 +150,7 @@ jobs:
           OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
         run: |
           set -euo pipefail
-          SCRIPT=$(find . -name 'admob_full_sync.py' -not -path './.git/*' | head -1)
+          SCRIPT=$(grep -rl 'admob_unified_fact' --include='*.py' . 2>/dev/null | head -1)
           python "$SCRIPT" --dim-health
 
   backfill:
@@ -186,7 +193,7 @@ jobs:
           CHUNK_IDX: ${{ matrix.chunk.idx }}
         run: |
           set -euo pipefail
-          SCRIPT=$(find . -name 'admob_full_sync.py' -not -path './.git/*' | head -1)
+          SCRIPT=$(grep -rl 'admob_unified_fact' --include='*.py' . 2>/dev/null | head -1)
           echo "Using script: $SCRIPT"
           echo "Chunk ${CHUNK_IDX}: ${CHUNK_START} -> ${CHUNK_END}"
           python "$SCRIPT" \
@@ -206,5 +213,5 @@ jobs:
           OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
         run: |
           set -euo pipefail
-          SCRIPT=$(find . -name 'admob_full_sync.py' -not -path './.git/*' | head -1)
+          SCRIPT=$(grep -rl 'admob_unified_fact' --include='*.py' . 2>/dev/null | head -1)
           python "$SCRIPT" --dim-health
