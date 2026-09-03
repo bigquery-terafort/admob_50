@@ -1,8 +1,16 @@
-name: AdMob Full Sync to BigQuery
+name: AdMob Full Sync to BigQuery (admob_50 / Account 2)
 
 # =============================================================================
-#  YE FILE CHAARO ADMOB REPOS MEIN BINA KISI TABDEELI KE LAGTI HAI.
-#  Publisher ka farq sirf ADMOB_PUBLISHER_ID secret se aata hai.
+#  ⚠️  YE VERSION SIRF admob_50 KE LIYE HAI.
+#      Is repo ke secrets par _ACCOUNT2 suffix hai:
+#          ADMOB_PUBLISHER_ID_ACCOUNT2
+#          OAUTH_CLIENT_ID_ACCOUNT2
+#          OAUTH_CLIENT_SECRET_ACCOUNT2
+#          OAUTH_REFRESH_TOKEN_ACCOUNT2
+#      (GCP_PROJECT_ID / GCP_CREDENTIALS_JSON / BQ_DATASET_ID /
+#       BQ_LOCATION / ADMOB_REPORT_CURRENCY par suffix NAHI hai.)
+#      Baqi repos mein suffix alag ya nadarad ho sakta hai — copy karne
+#      se pehle Settings > Secrets and variables > Actions check karo.
 #
 #  path: .github/workflows/<jo bhi naam ho>.yml
 #
@@ -132,11 +140,11 @@ jobs:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
-          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID_ACCOUNT2 }}
           ADMOB_REPORT_CURRENCY: ${{ secrets.ADMOB_REPORT_CURRENCY }}
-          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
-          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
-          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID_ACCOUNT2 }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET_ACCOUNT2 }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN_ACCOUNT2 }}
           DIM_SHRINK_PCT: ${{ github.event.inputs.dim_shrink_pct || '0.5' }}
           DAYS_BACK: ${{ github.event.inputs.days_back || '3' }}
         run: |
@@ -152,10 +160,10 @@ jobs:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
-          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
-          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
-          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
-          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID_ACCOUNT2 }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID_ACCOUNT2 }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET_ACCOUNT2 }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN_ACCOUNT2 }}
         run: |
           set -euo pipefail
           SCRIPT=$(grep -rl 'admob_unified_fact' --include='*.py' . 2>/dev/null | head -1)
@@ -190,11 +198,11 @@ jobs:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
-          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID_ACCOUNT2 }}
           ADMOB_REPORT_CURRENCY: ${{ secrets.ADMOB_REPORT_CURRENCY }}
-          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
-          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
-          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID_ACCOUNT2 }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET_ACCOUNT2 }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN_ACCOUNT2 }}
           DIM_SHRINK_PCT: ${{ github.event.inputs.dim_shrink_pct || '0.5' }}
           CHUNK_START: ${{ matrix.chunk.start }}
           CHUNK_END: ${{ matrix.chunk.end }}
@@ -215,10 +223,10 @@ jobs:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
-          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
-          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
-          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
-          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID_ACCOUNT2 }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID_ACCOUNT2 }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET_ACCOUNT2 }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN_ACCOUNT2 }}
         run: |
           set -euo pipefail
           SCRIPT=$(grep -rl 'admob_unified_fact' --include='*.py' . 2>/dev/null | head -1)
