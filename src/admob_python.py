@@ -1,5 +1,5 @@
 """
-AdMob → BigQuery  (PRODUCTION v5)
+AdMob → BigQuery  (PRODUCTION v6)
 ==========================================================
 ⚠️  YE FILE CHAARO REPOS MEIN BILKUL EK JAISI LAGTI HAI.
     Publisher ka farq sirf ADMOB_PUBLISHER_ID env var se aata hai:
@@ -11,18 +11,36 @@ VERSION HISTORY:
   v4:       publisher_id everywhere · publisher-scoped DELETEs · auto schema
             migration · DELETE retry + schema verification · hard fail on
             missing publisher_id
-  v5 (2026-07-26) — DATA-LOSS GUARDS:
+  v5 (2026-07-26) — FACT TABLE DATA-LOSS GUARDS:
             🔴 sync_one_day mein DELETE ab SAB SE AAKHIR mein hai.
-               v4 mein `delete_range_for_publisher(...)` pehli line thi aur
-               fetch uske baad. Agar fetch adhoora rahe (403 batches) ya
-               khali laut aaye, us din ka data UD JATA aur admob_sync_log
-               phir bhi "SUCCESS" likh deta.
-               (Bilkul yehi shakl Apple ke analytics_app_store_downloads ke
-                saath hui — aadha saal is tarah gaya.)
-            🔴 fetch_batched ab (rows, skipped) deta hai. v4 mein 403 pe
-               sirf `print WARNING` tha — adhoora data chup-chaap guzar jata.
             🛡️ GUARD 1: koi batch 403 → us din ko haath hi mat lagao
             🛡️ GUARD 2: teeno report khali → bhi haath mat lagao
+
+  v6 (2026-09-03) — DIMENSION DATA-LOSS FIX:
+            🔴 BUG 1: v5 ka fix SIRF fact table pe laga tha. sync_dims mein
+               `delete_dim_for_publisher(...)` abhi bhi fetch se PEHLE thi.
+               Run #214 mein adUnits pe 401 aaya — DELETE ho chuki thi, load
+               kabhi nahi hua. pub-5972202469838280 ka poora
+               admob_ad_units_dim UD GAYA.
+               → Ab: PEHLE saara fetch, PHIR staging + atomic swap
+                 (BEGIN/COMMIT TRANSACTION). Bilkul Mintegral loader jaisa.
+
+            🔴 BUG 2: with_retry 401 pe turant `raise` karta tha
+               (`status < 500 and status != 429`). Ek transient auth blip =
+               table gaya. → Ab 401 pe credentials refresh karke retry.
+
+            🔴 BUG 3: sync_dims try/finally se BAHAR tha, is liye dimension
+               failure kabhi admob_sync_log mein nahi likhi jaati thi.
+               Run #214 ki koi row hi nahi hai.
+               → Ab dono sync() aur backfill() mein try ke ANDAR.
+
+            🔴 BUG 4: _verify_publisher_id_column() False de to DELETE skip
+               ho jati thi — magar load_rows phir bhi WRITE_APPEND karta tha
+               → duplicate dim rows (joins 2x fan out kar rahe the).
+               → Ab dims kabhi append nahi hote, sirf atomic swap.
+
+            🛡️ GUARD 3: fetch mein pehle se maujood rows ka SHRINK_PCT se
+               kam aaye to swap se inkaar — partial fetch se wipe nahi hoga.
 
 REQUIRED ENV VARS:
    ADMOB_PUBLISHER_ID    = pub-XXXXXXXXXXXXXXXX  (ya accounts/pub-XXXX)
@@ -34,14 +52,28 @@ REQUIRED ENV VARS:
    OAUTH_REFRESH_TOKEN   = <Refresh token for THIS publisher>
    GCP_CREDENTIALS_JSON  = <Service account JSON>
 
+OPTIONAL ENV VARS:
+   DIM_SHRINK_PCT        = 0.5   (refuse dim swap if new rows < 50% of old)
+
 USAGE:
-   python admob_sync_v5.py --days 3
-   python admob_sync_v5.py --backfill-start 2026-07-19 --backfill-end 2026-07-26
+   python admob_full_sync.py --days 3
+   python admob_full_sync.py --backfill-start 2026-07-19 --backfill-end 2026-07-26
+
+   # v6.1 — sab kuch isi EK file mein. Koi alag helper script nahi.
+   python admob_full_sync.py --plan-chunks     # backfill ko chunks mein tode
+   python admob_full_sync.py --dim-health      # dimension tables khaali to nahi?
 
 DATA MODEL:
    Money fields: INT64 MICROS — divide by 1,000,000 for USD
    Partition  : report_date (DAY)
    Cluster    : data_source, app_id, country_code, ad_format
+
+   ⚠️  admob_unified_fact mein TEEN grain ek saath hain (data_source):
+         admob_network         → AdMob ki apni demand (SUBSET)
+         admob_network_adtype  → wahi data, ad_type breakdown (SUBSET, DUPLICATE)
+         admob_mediation       → poori mediated revenue (YEHI TOTAL HAI)
+       Bina `WHERE data_source = 'admob_mediation'` ke SUM karne se
+       revenue double/triple count hoti hai.
 """
 
 import os
@@ -87,6 +119,12 @@ MAX_RETRIES    = 4
 RETRY_BACKOFF  = 8
 ROW_LIMIT_WARN = 90000
 
+# 🛡️ v6 GUARD 3: agar naya fetch purane rows ka is ratio se kam ho → swap mat karo
+try:
+    DIM_SHRINK_PCT = float(os.environ.get("DIM_SHRINK_PCT", "0.5"))
+except ValueError:
+    DIM_SHRINK_PCT = 0.5
+
 # App batch sizes per report type — proven safe vs 100K limit
 BATCH_NETWORK         = 5
 BATCH_NETWORK_ADTYPE  = 3
@@ -94,6 +132,11 @@ BATCH_MEDIATION       = 2
 
 # Pause after ALTER TABLE to let BQ metadata cache refresh
 SCHEMA_CACHE_WAIT_SEC = 3
+
+# v6: module-level creds handle so with_retry can refresh IN PLACE.
+# AuthorizedHttp holds a reference to this same object, so refreshing it
+# fixes the already-built discovery client — no rebuild needed.
+_CREDS: Optional[Credentials] = None
 
 # =============================================================================
 # SCHEMAS — publisher_id added to all tables that need attribution
@@ -209,6 +252,9 @@ def validate_config() -> bool:
 # =============================================================================
 
 def get_fresh_credentials() -> Credentials:
+    """v6: creds ko module level pe rakhta hai taake with_retry 401 pe
+    in-place refresh kar sake."""
+    global _CREDS
     creds = Credentials(
         token=None,
         refresh_token=REFRESH_TOKEN,
@@ -221,6 +267,7 @@ def get_fresh_credentials() -> Credentials:
         ],
     )
     creds.refresh(Request())
+    _CREDS = creds
     print(f"  Token refreshed ✅")
     return creds
 
@@ -235,18 +282,34 @@ def get_bq_client() -> bigquery.Client:
     return bigquery.Client(project=PROJECT_ID, credentials=creds, location=BQ_LOCATION)
 
 # =============================================================================
-# RETRY
+# RETRY   🔴 v6: 401 ab retry hota hai (credential refresh ke saath)
 # =============================================================================
 
-def with_retry(fn, label="call"):
+def with_retry(fn, label="call", auth_retry=True):
+    """v6: 401 ("missing required authentication credential") ab fatal nahi.
+
+    v5 mein `if status < 500 and status != 429: raise` tha — 401 seedha
+    upar chala jata tha. Run #214 mein wahi hua: adUnits pe 401, aur us se
+    pehle DELETE ho chuki thi.
+    """
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return fn()
         except HttpError as e:
-            if e.resp.status < 500 and e.resp.status != 429:
+            status = e.resp.status
+            if status == 401 and auth_retry and _CREDS is not None and attempt < MAX_RETRIES:
+                print(f"  [{label}] 401 received — forcing credential refresh …")
+                try:
+                    _CREDS.refresh(Request())
+                    print(f"  [{label}] credentials refreshed ✅")
+                except Exception as refresh_err:
+                    print(f"  [{label}] credential refresh FAILED: {refresh_err}")
+                last_err = e
+            elif status < 500 and status != 429:
                 raise
-            last_err = e
+            else:
+                last_err = e
         except Exception as e:
             last_err = e
         wait = RETRY_BACKOFF * attempt
@@ -312,11 +375,12 @@ def safe_ecpm(earnings_micros, impressions):
         pass
     return None
 
-def paginate(callable_, items_key: str) -> List[Dict]:
+def paginate(callable_, items_key: str, label: str = "paginate") -> List[Dict]:
     results, page_token = [], None
     while True:
         resp = with_retry(
-            lambda pt=page_token: callable_(pageToken=pt).execute() if pt else callable_().execute()
+            lambda pt=page_token: callable_(pageToken=pt).execute() if pt else callable_().execute(),
+            label=label
         )
         results.extend(resp.get(items_key, []))
         page_token = resp.get("nextPageToken")
@@ -379,11 +443,12 @@ def migrate_table_schema(bq: bigquery.Client, table_name: str, expected_schema):
         time.sleep(SCHEMA_CACHE_WAIT_SEC)
         bq.get_table(tid)
 
-def ensure_table(bq: bigquery.Client, name: str, schema, is_fact=False):
+def ensure_table(bq: bigquery.Client, name: str, schema, is_fact=False, quiet=False):
     tid = f"{PROJECT_ID}.{DATASET_ID}.{name}"
     try:
         bq.get_table(tid)
-        print(f"  Table exists: {name}")
+        if not quiet:
+            print(f"  Table exists: {name}")
         migrate_table_schema(bq, name, schema)
     except NotFound:
         t = bigquery.Table(tid, schema=schema)
@@ -397,9 +462,11 @@ def ensure_table(bq: bigquery.Client, name: str, schema, is_fact=False):
         print(f"  Created table: {name}")
 
 def load_rows(bq: bigquery.Client, table: str, schema, rows: List[Dict],
-              disposition=bigquery.WriteDisposition.WRITE_APPEND) -> int:
+              disposition=bigquery.WriteDisposition.WRITE_APPEND,
+              quiet=False) -> int:
     if not rows:
-        print(f"  No rows for {table}")
+        if not quiet:
+            print(f"  No rows for {table}")
         return 0
     tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
     cfg = bigquery.LoadJobConfig(schema=schema, write_disposition=disposition)
@@ -409,9 +476,24 @@ def load_rows(bq: bigquery.Client, table: str, schema, rows: List[Dict],
         job.result()
         return len(rows)
 
-    n = with_retry(_load, label=table)
-    print(f"  Loaded {n:,} rows → {table}")
+    n = with_retry(_load, label=table, auth_retry=False)
+    if not quiet:
+        print(f"  Loaded {n:,} rows → {table}")
     return n
+
+def count_dim_rows(bq: bigquery.Client, table: str, publisher_id: str) -> int:
+    """Existing row count for this publisher. -1 if table/column unavailable."""
+    tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
+    try:
+        job = bq.query(
+            f"SELECT COUNT(*) AS n FROM `{tid}` WHERE publisher_id = @pub",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("pub", "STRING", publisher_id)
+            ])
+        )
+        return list(job.result())[0]["n"]
+    except Exception:
+        return -1
 
 def _verify_publisher_id_column(bq: bigquery.Client, table: str) -> bool:
     """Confirm publisher_id column exists (guards BQ metadata cache staleness)."""
@@ -437,8 +519,11 @@ def delete_range_for_publisher(bq: bigquery.Client, table: str, publisher_id: st
         raise ValueError("delete_range_for_publisher: publisher_id is required (empty)")
 
     if not _verify_publisher_id_column(bq, table):
-        print(f"  ⚠️  Skipping DELETE for {table} — publisher_id column missing")
-        return
+        raise RuntimeError(
+            f"{table}: publisher_id column missing — refusing to DELETE. "
+            f"v5 mein yahan sirf skip hota tha aur load phir bhi APPEND karta tha "
+            f"(duplicate rows). Schema migrate karke dobara chalao."
+        )
 
     tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
 
@@ -446,32 +531,76 @@ def delete_range_for_publisher(bq: bigquery.Client, table: str, publisher_id: st
         return bq.query(
             f"""
             DELETE FROM `{tid}`
-            WHERE report_date BETWEEN '{start}' AND '{end}'
-              AND publisher_id = '{publisher_id}'
-            """
+            WHERE report_date BETWEEN @start AND @end
+              AND publisher_id = @pub
+            """,
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("start", "DATE", str(start)),
+                bigquery.ScalarQueryParameter("end",   "DATE", str(end)),
+                bigquery.ScalarQueryParameter("pub",   "STRING", publisher_id),
+            ])
         ).result()
 
-    with_retry(_do_delete, label=f"delete_range_{table}")
+    with_retry(_do_delete, label=f"delete_range_{table}", auth_retry=False)
     print(f"  Deleted {table} for {publisher_id}: {start} → {end}")
 
-def delete_dim_for_publisher(bq: bigquery.Client, table: str, publisher_id: str):
-    """Delete ONLY this publisher's dim rows."""
+# =============================================================================
+# 🔴 v6 CORE FIX — ATOMIC DIMENSION SWAP
+# =============================================================================
+
+def swap_dim_for_publisher(bq: bigquery.Client, table: str, schema,
+                           publisher_id: str, rows: List[Dict],
+                           min_rows: int = 1):
+    """Fetch-first, non-destructive dimension replace.
+
+    v5 tak: DELETE → fetch → load.  Fetch fail = data hamesha ke liye gaya.
+    v6:     fetch (caller) → staging → BEGIN/COMMIT TRANSACTION swap.
+
+    Agar rows khali ya shaq-e-qabil kam hain to RuntimeError — purana data
+    chhua tak nahi jata.
+    """
     if not publisher_id:
-        raise ValueError("delete_dim_for_publisher: publisher_id is required (empty)")
+        raise ValueError("swap_dim_for_publisher: publisher_id is required (empty)")
 
-    if not _verify_publisher_id_column(bq, table):
-        print(f"  ⚠️  Skipping dim DELETE for {table} — publisher_id column missing")
-        return
+    # ── 🛡️ GUARD A: khali / bohot kam rows → swap se inkaar ──────────────
+    if len(rows) < min_rows:
+        raise RuntimeError(
+            f"{table}/{publisher_id}: fetch returned {len(rows)} rows "
+            f"(minimum {min_rows}) — refusing to swap. Existing data preserved."
+        )
 
-    tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
+    # ── 🛡️ GUARD B (v6): purane ke muqable bohot simat gaya → inkaar ──────
+    existing = count_dim_rows(bq, table, publisher_id)
+    if existing > 0 and len(rows) < existing * DIM_SHRINK_PCT:
+        raise RuntimeError(
+            f"{table}/{publisher_id}: fetch returned {len(rows):,} rows but "
+            f"{existing:,} already exist (< {DIM_SHRINK_PCT:.0%}). Looks like a "
+            f"partial fetch — refusing to swap. Set DIM_SHRINK_PCT=0 to override."
+        )
 
-    def _do_delete():
-        return bq.query(
-            f"DELETE FROM `{tid}` WHERE publisher_id = '{publisher_id}'"
-        ).result()
+    stg  = f"_stg_{table}"
+    tid  = f"{PROJECT_ID}.{DATASET_ID}.{table}"
+    sid  = f"{PROJECT_ID}.{DATASET_ID}.{stg}"
+    cols = ", ".join(f.name for f in schema)
 
-    with_retry(_do_delete, label=f"delete_dim_{table}")
-    print(f"  Deleted dim {table} for {publisher_id}")
+    ensure_table(bq, stg, schema, quiet=True)
+    load_rows(bq, stg, schema, rows,
+              disposition=bigquery.WriteDisposition.WRITE_TRUNCATE, quiet=True)
+
+    sql = f"""
+    BEGIN TRANSACTION;
+      DELETE FROM `{tid}` WHERE publisher_id = @pub;
+      INSERT INTO `{tid}` ({cols}) SELECT {cols} FROM `{sid}`;
+    COMMIT TRANSACTION;
+    """
+    cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("pub", "STRING", publisher_id)
+    ])
+
+    with_retry(lambda: bq.query(sql, job_config=cfg).result(),
+               label=f"swap_{table}", auth_retry=False)
+
+    print(f"  ✅ {len(rows):,} rows → {table}  ({publisher_id})  [atomic swap]")
 
 def write_log(bq, run_id, publisher_id, run_type, start, end, status, totals, error, duration):
     row = [{
@@ -485,7 +614,7 @@ def write_log(bq, run_id, publisher_id, run_type, start, end, status, totals, er
         "network_adtype_rows": totals.get("network_adtype", 0),
         "mediation_rows":      totals.get("mediation", 0),
         "total_rows":          sum(totals.values()),
-        "error_message":       error,
+        "error_message":       (error[:9000] if error else None),
         "duration_seconds":    round(duration, 2),
         "sync_timestamp":      utc_now(),
     }]
@@ -495,36 +624,39 @@ def write_log(bq, run_id, publisher_id, run_type, start, end, status, totals, er
         print(f"  WARNING: sync_log write failed: {e}")
 
 # =============================================================================
-# DIMENSION SYNC (publisher-scoped)
+# DIMENSION SYNC   🔴 v6: PEHLE SAARA FETCH, PHIR SWAP
 # =============================================================================
 
 def sync_dims(v1, bq: bigquery.Client, account: str, publisher_id: str) -> List[str]:
+    """v6: koi bhi DELETE tab tak nahi hoti jab tak TEENO dimensions ka
+    poora data haath mein na aa jaye."""
     ts = utc_now()
 
-    acc = with_retry(lambda: v1.accounts().get(name=account).execute())
+    # ══════════ PHASE 1 — FETCH (kuch bhi destructive nahi) ══════════
+    print("  Fetching account …")
+    acc = with_retry(lambda: v1.accounts().get(name=account).execute(), label="account")
 
-    if _verify_publisher_id_column(bq, DIM_ACCOUNT):
-        with_retry(lambda: bq.query(
-            f"""
-            DELETE FROM `{PROJECT_ID}.{DATASET_ID}.{DIM_ACCOUNT}`
-            WHERE publisher_id = '{publisher_id}'
-            """
-        ).result(), label="delete_account_dim")
+    print("  Fetching apps …")
+    apps = paginate(
+        lambda pageToken=None: v1.accounts().apps().list(parent=account, pageToken=pageToken),
+        "apps", label="apps.list"
+    )
 
-    load_rows(bq, DIM_ACCOUNT, ACCOUNT_SCHEMA, [{
+    print("  Fetching ad units …")
+    units = paginate(
+        lambda pageToken=None: v1.accounts().adUnits().list(parent=account, pageToken=pageToken),
+        "adUnits", label="adUnits.list"
+    )
+
+    # ══════════ PHASE 2 — TRANSFORM ══════════
+    account_rows = [{
         "account_resource_name": acc.get("name"),
         "publisher_id":          publisher_id,
         "reporting_time_zone":   acc.get("reportingTimeZone"),
         "currency_code":         acc.get("currencyCode"),
         "sync_timestamp":        ts,
-    }])
+    }]
 
-    # Apps dim
-    delete_dim_for_publisher(bq, DIM_APPS, publisher_id)
-    apps = paginate(
-        lambda pageToken=None: v1.accounts().apps().list(parent=account, pageToken=pageToken),
-        "apps"
-    )
     app_rows, app_ids = [], []
     for a in apps:
         mi = a.get("manualAppInfo", {})
@@ -543,14 +675,7 @@ def sync_dims(v1, bq: bigquery.Client, account: str, publisher_id: str) -> List[
             "app_approval_state":  a.get("appApprovalState"),
             "sync_timestamp":      ts,
         })
-    load_rows(bq, DIM_APPS, APPS_SCHEMA, app_rows)
 
-    # Ad units dim
-    delete_dim_for_publisher(bq, DIM_AD_UNITS, publisher_id)
-    units = paginate(
-        lambda pageToken=None: v1.accounts().adUnits().list(parent=account, pageToken=pageToken),
-        "adUnits"
-    )
     unit_rows = [{
         "ad_unit_resource_name": u.get("name"),
         "ad_unit_id":            u.get("adUnitId"),
@@ -561,7 +686,11 @@ def sync_dims(v1, bq: bigquery.Client, account: str, publisher_id: str) -> List[
         "ad_types":              u.get("adTypes", []),
         "sync_timestamp":        ts,
     } for u in units]
-    load_rows(bq, DIM_AD_UNITS, AD_UNITS_SCHEMA, unit_rows)
+
+    # ══════════ PHASE 3 — ATOMIC SWAP (ab mehfooz) ══════════
+    swap_dim_for_publisher(bq, DIM_ACCOUNT,  ACCOUNT_SCHEMA,  publisher_id, account_rows)
+    swap_dim_for_publisher(bq, DIM_APPS,     APPS_SCHEMA,     publisher_id, app_rows)
+    swap_dim_for_publisher(bq, DIM_AD_UNITS, AD_UNITS_SCHEMA, publisher_id, unit_rows)
 
     print(f"  Publisher {publisher_id}: {len(app_ids)} apps, {len(unit_rows)} ad units")
     return app_ids
@@ -613,12 +742,14 @@ def mediation_spec(start, end, app_ids):
 
 def fetch_network(v1, account, body):
     return with_retry(
-        lambda: v1.accounts().networkReport().generate(parent=account, body=body).execute()
+        lambda: v1.accounts().networkReport().generate(parent=account, body=body).execute(),
+        label="networkReport"
     )
 
 def fetch_mediation_report(v1, account, body):
     return with_retry(
-        lambda: v1.accounts().mediationReport().generate(parent=account, body=body).execute()
+        lambda: v1.accounts().mediationReport().generate(parent=account, body=body).execute(),
+        label="mediationReport"
     )
 
 # =============================================================================
@@ -752,18 +883,15 @@ def parse_mediation_rows(report, run_id, publisher_id):
     return rows
 
 # =============================================================================
-# BATCHED FETCH   🛡️ v5: ab (rows, skipped) deta hai
+# BATCHED FETCH   🛡️ v5: (rows, skipped) deta hai
 # =============================================================================
 
 def fetch_batched(v1, account, app_ids, start, end, run_id, publisher_id,
                   spec_fn, parse_fn, fetch_fn, batch_size, label) -> Tuple[List[Dict], int]:
-    """v5: skipped batches ki GINTI bhi wapas karta hai.
-
-    v4 mein 403 pe sirf `print WARNING` tha — adhoora data chup-chaap
-    guzar jata aur caller poore din ka DELETE kar deta.
-    """
+    """403 batches ki GINTI wapas karta hai taake caller adhoore data pe
+    DELETE na kare."""
     all_rows: List[Dict] = []
-    skipped  = 0                                    # 🛡️ v5
+    skipped  = 0
     batches  = make_batches(app_ids, batch_size)
     total_b  = len(batches)
 
@@ -778,7 +906,7 @@ def fetch_batched(v1, account, app_ids, start, end, run_id, publisher_id,
         except HttpError as e:
             if e.resp.status == 403:
                 print(f"  WARNING: {label} batch {i}/{total_b} skipped — 403")
-                skipped += 1                        # 🛡️ v5: chhupao mat
+                skipped += 1
             else:
                 raise
 
@@ -812,17 +940,11 @@ def ensure_all_tables(bq: bigquery.Client):
     ensure_table(bq, LOG_TABLE,    SYNC_LOG_SCHEMA)
 
 # =============================================================================
-# SYNC ONE DAY   🔴 v5 KA ASLI FIX
+# SYNC ONE DAY   (v5 guards — unchanged, they work)
 # =============================================================================
 
 def sync_one_day(v1, bq, account, app_ids, publisher_id, day, run_id) -> Dict[str, int]:
-    """v5: PEHLE poora data haath mein lo — TAB purana hatao.
-
-    v4 mein `delete_range_for_publisher(...)` sab se pehli line thi aur fetch
-    uske baad. Agar fetch adhoora rahe (403 batches) ya khali laut aaye, us
-    din ka data HAMESHA ke liye gaya — aur admob_sync_log phir bhi "SUCCESS"
-    likh deta.
-    """
+    """PEHLE poora data haath mein lo — TAB purana hatao."""
     totals = {"network": 0, "network_adtype": 0, "mediation": 0}
 
     print(f"  [{day}] Fetching network for {publisher_id} …")
@@ -854,8 +976,6 @@ def sync_one_day(v1, bq, account, app_ids, publisher_id, day, run_id) -> Dict[st
             raise
 
     # ── 🛡️ GUARD 1: koi bhi batch 403 hua → us din ko haath mat lagao ──
-    #    Adhoore data ke saath DELETE = jo batches nahi aayin unka data
-    #    hamesha ke liye gaya. Purana data bacha rehna behtar hai.
     skipped = net_skip + nat_skip + med_skip
     if skipped:
         raise RuntimeError(
@@ -881,17 +1001,15 @@ def sync_one_day(v1, bq, account, app_ids, publisher_id, day, run_id) -> Dict[st
     return totals
 
 # =============================================================================
-# SYNC + BACKFILL
+# SYNC + BACKFILL   🔴 v6: sync_dims ab try/finally ke ANDAR
 # =============================================================================
 
-def sync(days_back: int = 3):
+def _run(run_type: str, start_date: date, end_date: date, sleep_between: int):
     publisher_id = normalize_publisher_id(ADMOB_PUBLISHER_ID)
     rid          = run_id_now()
     t0           = time.time()
-    end_date     = datetime.utcnow().date() - timedelta(days=1)
-    start_date   = end_date - timedelta(days=days_back - 1)
 
-    print(f"\n=== AdMob Sync v5 | publisher={publisher_id} | run_id={rid} ===")
+    print(f"\n=== AdMob {run_type.title()} v6 | publisher={publisher_id} | run_id={rid} ===")
     print(f"  Date range : {start_date} → {end_date}")
 
     creds   = get_fresh_credentials()
@@ -902,93 +1020,217 @@ def sync(days_back: int = 3):
 
     ensure_all_tables(bq)
 
-    print("\nSyncing dimensions …")
-    app_ids = sync_dims(v1, bq, account, publisher_id)
-
     grand = {"network": 0, "network_adtype": 0, "mediation": 0}
     error, status = None, "SUCCESS"
-
-    try:
-        cur = start_date
-        while cur <= end_date:
-            creds = get_fresh_credentials()
-            v1    = get_v1(creds)
-            t = sync_one_day(v1, bq, account, app_ids, publisher_id, cur, rid)
-            for k in grand:
-                grand[k] += t.get(k, 0)
-            cur += timedelta(days=1)
-            time.sleep(1)
-    except Exception as e:
-        status, error = "FAILED", str(e)
-        raise
-    finally:
-        write_log(bq, rid, publisher_id, "sync", start_date, end_date,
-                  status, grand, error, time.time() - t0)
-
-    print(f"\n=== Sync complete for {publisher_id} ===")
-    print(json.dumps(grand, indent=2))
-
-def backfill(start_str: str, end_str: str):
-    publisher_id = normalize_publisher_id(ADMOB_PUBLISHER_ID)
-    rid          = run_id_now()
-    t0           = time.time()
-    start_date   = datetime.strptime(start_str, "%Y-%m-%d").date()
-    end_date     = datetime.strptime(end_str,   "%Y-%m-%d").date()
-
-    print(f"\n=== AdMob Backfill v5 | publisher={publisher_id} | run_id={rid} ===")
-    print(f"  Date range : {start_date} → {end_date}")
-
-    creds   = get_fresh_credentials()
-    v1      = get_v1(creds)
-    bq      = get_bq_client()
-    account = get_account_name(v1)
-    print(f"  Account    : {account}")
-
-    ensure_all_tables(bq)
-
-    print("\nSyncing dimensions …")
-    app_ids = sync_dims(v1, bq, account, publisher_id)
-
-    grand = {"network": 0, "network_adtype": 0, "mediation": 0}
-    error, status = None, "SUCCESS"
-    cur   = start_date
     total_days = (end_date - start_date).days + 1
-    done  = 0
+    done = 0
 
     try:
+        # 🔴 v6: dimensions ab try ke ANDAR — failure ab log hoti hai
+        print("\nSyncing dimensions …")
+        app_ids = sync_dims(v1, bq, account, publisher_id)
+
+        if not app_ids:
+            raise RuntimeError(
+                f"{publisher_id}: 0 apps returned — refusing to run reports "
+                f"(app filter would be empty)."
+            )
+
+        cur = start_date
         while cur <= end_date:
             done += 1
             print(f"\n--- Day {done}/{total_days}: {cur} ---")
-
             creds = get_fresh_credentials()
             v1    = get_v1(creds)
-
             t = sync_one_day(v1, bq, account, app_ids, publisher_id, cur, rid)
             for k in grand:
                 grand[k] += t.get(k, 0)
-
             cur += timedelta(days=1)
-            time.sleep(2)
-
+            time.sleep(sleep_between)
     except Exception as e:
         status, error = "FAILED", str(e)
         raise
     finally:
-        write_log(bq, rid, publisher_id, "backfill", start_date, end_date,
+        write_log(bq, rid, publisher_id, run_type, start_date, end_date,
                   status, grand, error, time.time() - t0)
 
-    print(f"\n=== Backfill complete for {publisher_id} ===")
+    print(f"\n=== {run_type.title()} complete for {publisher_id} ===")
     print(json.dumps(grand, indent=2))
+
+def sync(days_back: int = 3):
+    end_date   = datetime.utcnow().date() - timedelta(days=1)
+    start_date = end_date - timedelta(days=days_back - 1)
+    _run("sync", start_date, end_date, sleep_between=1)
+
+def backfill(start_str: str, end_str: str):
+    start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+    end_date   = datetime.strptime(end_str,   "%Y-%m-%d").date()
+    if start_date > end_date:
+        raise ValueError(f"backfill-start ({start_date}) is after backfill-end ({end_date})")
+    _run("backfill", start_date, end_date, sleep_between=2)
+
+# =============================================================================
+# 🆕 v6.1 — CHUNK PLANNER   (pehle alag plan_chunks.py thi)
+# =============================================================================
+
+# Daily mode mein bhi matrix KHAALI nahi ho sakta — GitHub khaali array par
+# workflow-level error deta hai chahe job ka `if:` false ho (run #110:
+# 0 seconds, "workflow graph cannot be shown"). Is liye placeholder.
+_CHUNK_PLACEHOLDER = [{"idx": 0, "start": "1970-01-01", "end": "1970-01-01"}]
+
+
+def _emit_gh_output(mode: str, chunks: List[Dict]) -> None:
+    line_mode   = f"mode={mode}"
+    line_chunks = f"chunks={json.dumps(chunks, separators=(',', ':'))}"
+    out = os.environ.get("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a", encoding="utf-8") as fh:
+            fh.write(line_mode + "\n")
+            fh.write(line_chunks + "\n")
+    print(line_mode)
+    print(line_chunks)
+
+
+def plan_chunks() -> int:
+    """Backfill range ko chhote chunks mein todta hai.
+
+    KYUN: run #107 (Admob_4 / pub-9688) 60-min timeout par cancel hui.
+          Maap: 06-05 → 06-21 = 17 din, ~57 min = ~3.2 min/din.
+          90 din = ~290 min — single job mein kabhi poora nahi hoga.
+          Chunks mein har job ~50 min, aur chunk 4 fail ho to sirf
+          chunk 4 dobara chalao.
+
+    Env: BF_START · BF_END · CHUNK_DAYS (default 15)
+    Writes to GITHUB_OUTPUT:  mode=daily|backfill  ·  chunks=<json>
+    """
+    start_raw = (os.environ.get("BF_START") or "").strip()
+    end_raw   = (os.environ.get("BF_END")   or "").strip()
+
+    if not start_raw or not end_raw:
+        print("Mode: DAILY SYNC (no backfill dates given)")
+        _emit_gh_output("daily", _CHUNK_PLACEHOLDER)
+        return 0
+
+    try:
+        start = datetime.strptime(start_raw, "%Y-%m-%d").date()
+        end   = datetime.strptime(end_raw,   "%Y-%m-%d").date()
+    except ValueError as e:
+        print(f"❌ ERROR: bad date format ({e}). Use YYYY-MM-DD.")
+        return 1
+
+    if start > end:
+        print(f"❌ ERROR: backfill-start {start} is after backfill-end {end}")
+        return 1
+
+    try:
+        size = max(1, int((os.environ.get("CHUNK_DAYS") or "15").strip()))
+    except ValueError:
+        size = 15
+
+    chunks, cur, idx = [], start, 0
+    while cur <= end:
+        idx += 1
+        stop = min(cur + timedelta(days=size - 1), end)
+        chunks.append({"idx": idx, "start": cur.isoformat(), "end": stop.isoformat()})
+        cur = stop + timedelta(days=1)
+
+    total_days = (end - start).days + 1
+    print(f"Mode: BACKFILL {start} → {end} ({total_days} days) "
+          f"in {len(chunks)} chunk(s) of {size}")
+    for c in chunks:
+        span = (datetime.strptime(c["end"], "%Y-%m-%d").date()
+                - datetime.strptime(c["start"], "%Y-%m-%d").date()).days + 1
+        print(f"   chunk {c['idx']}: {c['start']} → {c['end']}  "
+              f"({span}d, ~{round(span * 3.2)} min)")
+
+    _emit_gh_output("backfill", chunks)
+    return 0
+
+# =============================================================================
+# 🆕 v6.1 — DIMENSION HEALTH CHECK   (pehle alag dim_health.py thi)
+# =============================================================================
+
+def dim_health() -> int:
+    """Har run ke BAAD chalta hai. Job ko FAIL karta hai agar is publisher
+    ki koi dimension table khaali ho — chahe sync "SUCCESS" keh chuki ho.
+
+    KYUN: run #214 mein admob_ad_units_dim se pub-5972202469838280 ki SAARI
+          5,713 rows ud gayi thin (DELETE chali, adUnits par 401 aaya, load
+          kabhi hua hi nahi). Table din bhar khaali padi rahi aur kisi ko
+          pata nahi chala.
+    """
+    publisher_id = normalize_publisher_id(ADMOB_PUBLISHER_ID)
+    if not publisher_id:
+        print("❌ ERROR: ADMOB_PUBLISHER_ID missing — cannot run health check")
+        return 1
+
+    bq = get_bq_client()
+    print(f"\n── dimension health: {PROJECT_ID}.{DATASET_ID} / {publisher_id} " + "─" * 15)
+
+    expected = {DIM_ACCOUNT: 1, DIM_APPS: 1, DIM_AD_UNITS: 1}
+    failed   = []
+
+    for table, minimum in expected.items():
+        tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
+        try:
+            row = list(bq.query(
+                f"SELECT COUNT(*) AS n, "
+                f"CAST(MAX(sync_timestamp) AS STRING) AS last_sync "
+                f"FROM `{tid}` WHERE publisher_id = @p",
+                job_config=bigquery.QueryJobConfig(query_parameters=[
+                    bigquery.ScalarQueryParameter("p", "STRING", publisher_id)
+                ])
+            ).result())[0]
+            n, last_sync = row["n"], row["last_sync"]
+            mark = "OK   " if n >= minimum else "EMPTY"
+            print(f"   [{mark}] {table:<22} {n:>8,} rows   last_sync={last_sync}")
+            if n < minimum:
+                failed.append(table)
+        except Exception as e:
+            print(f"   [ERROR] {table:<22} {type(e).__name__}: {e}")
+            failed.append(table)
+
+    # Fact freshness — dims bhari hon magar fact purani ho to bhi masla hai
+    try:
+        row = list(bq.query(
+            f"SELECT CAST(MAX(report_date) AS STRING) AS last_dt, "
+            f"DATE_DIFF(CURRENT_DATE(), MAX(report_date), DAY) AS stale "
+            f"FROM `{PROJECT_ID}.{DATASET_ID}.{FACT_TABLE}` WHERE publisher_id = @p",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("p", "STRING", publisher_id)
+            ])
+        ).result())[0]
+        stale = row["stale"]
+        mark = "OK   " if stale is not None and stale <= 4 else "STALE"
+        print(f"   [{mark}] {FACT_TABLE:<22} last={row['last_dt']} ({stale}d old)")
+    except Exception as e:
+        print(f"   [ERROR] {FACT_TABLE:<22} {type(e).__name__}: {e}")
+
+    if failed:
+        print("\n:: DIMENSION TABLE EMPTY FOR THIS PUBLISHER ::")
+        print(f"   Affected: {', '.join(failed)}")
+        print("   Ye #214 wali shakl hai: DELETE chali, fetch mara, load nahi hua.")
+        print("   → Workflow dobara chalao. Agar phir bhi khaali rahe to AdMob API")
+        print("     is account ke liye apps/adUnits list refuse kar rahi hai.")
+        return 1
+
+    print("\n   Dimension health OK.")
+    return 0
 
 # =============================================================================
 # CLI
 # =============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="AdMob → BigQuery sync v5")
+    p = argparse.ArgumentParser(description="AdMob → BigQuery sync v6.1")
     p.add_argument("--days",           type=int, default=3)
     p.add_argument("--backfill-start", type=str)
     p.add_argument("--backfill-end",   type=str)
+    # 🆕 v6.1: ye dono modes pehle alag .py files mein the
+    p.add_argument("--plan-chunks", action="store_true",
+                   help="Backfill range ko chunks mein tode (GITHUB_OUTPUT likhta hai)")
+    p.add_argument("--dim-health",  action="store_true",
+                   help="Dimension tables khaali to nahi — exit 1 agar hain")
     # Kept for backwards compatibility with existing GitHub Actions YAML
     p.add_argument("--chunk",          type=int, default=1)
     p.add_argument("--chunk-days",     type=int, default=1)
@@ -996,8 +1238,19 @@ def main():
     p.add_argument("--enable-campaign-beta", action="store_true")
     args = p.parse_args()
 
+    # --plan-chunks ko koi credential nahi chahiye — validate_config se pehle
+    if args.plan_chunks:
+        sys.exit(plan_chunks())
+
     if not validate_config():
         sys.exit(1)
+
+    if args.dim_health:
+        try:
+            sys.exit(dim_health())
+        except Exception as e:
+            print(f"FATAL ERROR (dim-health): {e}")
+            sys.exit(1)
 
     try:
         if args.backfill_start and args.backfill_end:
