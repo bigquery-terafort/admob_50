@@ -1,27 +1,26 @@
-name: AdMob Full Sync to BigQuery (Account 4 - admob4_968)
+name: AdMob Full Sync to BigQuery
 
 # =============================================================================
-#  repo: bigquery-terafort/Admob_4       publisher: pub-9688592152492531
-#  path: .github/workflows/admob_sync.yml
+#  YE FILE CHAARO ADMOB REPOS MEIN BINA KISI TABDEELI KE LAGTI HAI.
+#  Publisher ka farq sirf ADMOB_PUBLISHER_ID secret se aata hai.
 #
-#  v6.1: sirf EK python file call hoti hai — src/admob_full_sync.py
-#        Koi alag plan_chunks.py / dim_health.py nahi. Modes:
-#            --plan-chunks   backfill ko chunks mein tode
-#            --dim-health    dimension tables khaali to nahi
-#            --days N        daily sync
-#            --backfill-*    ek chunk
+#  path: .github/workflows/<jo bhi naam ho>.yml
 #
-#  RUN #107 KYUN MARA — TIMEOUT, SCRIPT KA ERROR NAHI
-#    "cancelled in 1h 0m 16s" = GitHub ka timeout-minutes: 60
-#    MAAP: 06-05 -> 06-21 = 17 din, ~57 min = ~3.2 min/din
-#      pub-5036   13.5K rows/din   0.87 min/din   90 din =  78 min  OK
-#      pub-9688   39.0K rows/din   3.20 min/din   90 din = ~290 min FAIL
-#    DATA MEHFOOZ RAHA: v6 ka fetch-before-delete chala.
-#    0 missing days, 0 duplicate runs (BigQuery se verify kiya).
+#  RUN #129 KYUN MARA — GALAT PATH
+#    python: can't open file '.../src/admob_full_sync.py': No such file
+#    Har repo ka layout alag hai. Kuch mein script root pe hai, kuch mein
+#    src/ ke andar. Hard-coded path chaaro repos mein kaam nahi karta.
+#    → Ab workflow script ko KHUD DHOONDHTI hai (find). Kahin bhi rakho,
+#      chal jayegi.
 #
 #  RUN #110 KYUN MARA — 0 SECONDS, YAML PARSE ERROR
-#    File ke shuru mein markdown note (`> **NOTE:**`) tha. Valid YAML nahi.
-#    Ab file `name:` se shuru hoti hai aur koi embedded python heredoc nahi.
+#    File ke shuru mein markdown note tha. Ab file `name:` se shuru hoti hai
+#    aur YAML ke andar koi embedded python heredoc nahi.
+#
+#  RUN #107 KYUN MARA — 60-MIN TIMEOUT (Admob_4 / pub-9688)
+#    Maap: 17 din ~57 min = ~3.2 min/din. 90 din = ~290 min.
+#    → Backfill ab 15-din ke chunks mein. Har chunk ~50 min.
+#    DATA MEHFOOZ RAHA: v6 ka fetch-before-delete chala.
 #
 #  max-parallel: 1 LAZMI — har chunk shuru mein sync_dims chalata hai jo
 #  publisher-scoped DELETE+INSERT transaction hai. Parallel chunks usi
@@ -50,7 +49,7 @@ on:
         required: false
         default: ''
       chunk_days:
-        description: 'Har chunk kitne din (default 15 - ye account bara hai)'
+        description: 'Har chunk kitne din (default 15)'
         required: false
         default: '15'
       dim_shrink_pct:
@@ -59,7 +58,7 @@ on:
         default: '0.5'
 
 concurrency:
-  group: admob4-sync-${{ github.ref }}
+  group: admob-sync-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -85,13 +84,20 @@ jobs:
           CHUNK_DAYS: ${{ github.event.inputs.chunk_days || '15' }}
         run: |
           set -euo pipefail
-          python src/admob_full_sync.py --plan-chunks
+          SCRIPT=$(find . -name 'admob_full_sync.py' -not -path './.git/*' | head -1)
+          if [ -z "$SCRIPT" ]; then
+            echo "::error::admob_full_sync.py repo mein kahin nahi mili"
+            find . -name '*.py' -not -path './.git/*' | head -20
+            exit 1
+          fi
+          echo "Using script: $SCRIPT"
+          python "$SCRIPT" --plan-chunks
 
   daily:
     needs: plan
     if: needs.plan.outputs.mode == 'daily'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -120,7 +126,9 @@ jobs:
           DAYS_BACK: ${{ github.event.inputs.days_back || '3' }}
         run: |
           set -euo pipefail
-          python src/admob_full_sync.py --days "${DAYS_BACK}"
+          SCRIPT=$(find . -name 'admob_full_sync.py' -not -path './.git/*' | head -1)
+          echo "Using script: $SCRIPT"
+          python "$SCRIPT" --days "${DAYS_BACK}"
 
       - name: Verify dimension health
         if: always()
@@ -133,7 +141,10 @@ jobs:
           OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
           OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
           OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
-        run: python src/admob_full_sync.py --dim-health
+        run: |
+          set -euo pipefail
+          SCRIPT=$(find . -name 'admob_full_sync.py' -not -path './.git/*' | head -1)
+          python "$SCRIPT" --dim-health
 
   backfill:
     needs: plan
@@ -175,8 +186,10 @@ jobs:
           CHUNK_IDX: ${{ matrix.chunk.idx }}
         run: |
           set -euo pipefail
+          SCRIPT=$(find . -name 'admob_full_sync.py' -not -path './.git/*' | head -1)
+          echo "Using script: $SCRIPT"
           echo "Chunk ${CHUNK_IDX}: ${CHUNK_START} -> ${CHUNK_END}"
-          python src/admob_full_sync.py \
+          python "$SCRIPT" \
             --backfill-start "${CHUNK_START}" \
             --backfill-end "${CHUNK_END}"
 
@@ -191,4 +204,7 @@ jobs:
           OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
           OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
           OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
-        run: python src/admob_full_sync.py --dim-health
+        run: |
+          set -euo pipefail
+          SCRIPT=$(find . -name 'admob_full_sync.py' -not -path './.git/*' | head -1)
+          python "$SCRIPT" --dim-health
